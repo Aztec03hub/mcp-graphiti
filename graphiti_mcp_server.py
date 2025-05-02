@@ -1042,16 +1042,30 @@ def main():
 # --- NEW: Helper function for robust module loading ---
 def _load_and_register_entity_module(file_path: Path) -> None:
     """Loads a single Python file, finds, and registers entity classes."""
-    module_name = file_path.stem
+    # Determine the relative path from the base directory
+    try:
+        # Get path relative to /app/entities (or any project entities dir)
+        rel_path = file_path.relative_to(Path("/app/entities"))
+        # Convert path like entities/connectors/agent.py to entities.connectors.agent
+        module_parts = [p for p in rel_path.with_suffix('').parts]
+        if module_parts[0] != "entities":
+            module_parts.insert(0, "entities")  # Ensure entities is the root package
+        full_module_name = ".".join(module_parts)
+    except ValueError:
+        # If not under /app/entities, use just the filename as module name
+        module_name = file_path.stem
+        full_module_name = module_name
+    
     full_module_path = str(file_path.absolute())
     
     try:
         # Dynamically import the module
-        spec = importlib.util.spec_from_file_location(module_name, full_module_path)
+        spec = importlib.util.spec_from_file_location(full_module_name, full_module_path)
         if spec and spec.loader:
             module = importlib.util.module_from_spec(spec)
             # Add module to sys.modules BEFORE exec_module to handle circular imports if any
             # sys.modules[module_name] = module # Consider if needed, might complicate things
+            sys.modules[full_module_name] = module
             spec.loader.exec_module(module)
             
             entities_registered = 0
@@ -1110,6 +1124,13 @@ def load_entities_from_directory(directory_path: str, subdir_selection_spec: str
     if not base_directory.exists() or not base_directory.is_dir():
         logger.warning(f"Base entities directory '{directory_path}' does not exist or is not a directory. Skipping load.")
         return
+    
+    # Check if __init__.py exists in the base directory to determine if it's a package
+    base_init_file = base_directory / "__init__.py"
+    is_package = base_init_file.exists()
+    
+    if not is_package:
+        logger.info(f"Directory {directory_path} is not a proper Python package (missing __init__.py). Entities with relative imports may fail.")
 
     if not subdir_selection_spec:
         # Load all recursively from the base directory
