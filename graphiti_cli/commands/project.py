@@ -6,6 +6,10 @@ This module contains functions for initializing and managing Graphiti projects.
 import sys
 import os
 import re  # For entity name validation
+import shutil
+import platform
+import subprocess
+import time
 from pathlib import Path
 
 from ..utils.config import get_repo_root
@@ -133,6 +137,48 @@ def init_project(project_name: str, target_dir: Path):
     print(f"You can now create entity definitions in: {CYAN}{entities_dir}{NC}")
 
 
+def create_windows_hardlink(src_path: str, dest_path: str) -> bool:
+    """
+    Create a Windows hard link using PowerShell.
+    
+    Args:
+        src_path (str): Source file path in Windows format
+        dest_path (str): Destination file path in Windows format
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        # Create a PowerShell command to create a hard link
+        # This avoids using cmd.exe directly which might be causing the hang
+        ps_command = f'New-Item -ItemType HardLink -Path "{dest_path}" -Target "{src_path}" -Force'
+        
+        # Execute PowerShell command through WSL
+        # Use timeout to prevent indefinite hanging
+        process = subprocess.Popen(
+            ["powershell.exe", "-Command", ps_command],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        # Wait for the process with a timeout
+        try:
+            stdout, stderr = process.communicate(timeout=10)
+            if process.returncode != 0:
+                print(f"{YELLOW}PowerShell command failed: {stderr}{NC}")
+                return False
+            return True
+        except subprocess.TimeoutExpired:
+            process.kill()
+            print(f"{YELLOW}PowerShell command timed out{NC}")
+            return False
+            
+    except Exception as e:
+        print(f"{YELLOW}Error creating Windows hard link: {e}{NC}")
+        return False
+
+
 def setup_rules(project_name: str, target_dir: Path):
     """
     Set up Cursor rules for a project.
@@ -170,40 +216,95 @@ def setup_rules(project_name: str, target_dir: Path):
             for f in missing_files: print(f"  - {f}")
             sys.exit(1)
 
-        # Create/Update symlinks using relative paths for better portability
-        try:
-            core_rel_path = os.path.relpath(core_rule_src.resolve(), start=cursor_rules_dir.resolve())
-            maint_rel_path = os.path.relpath(maint_rule_src.resolve(), start=cursor_rules_dir.resolve())
-        except ValueError:
-            # Handle case where paths are on different drives (Windows) - fall back to absolute
-            print(f"{YELLOW}Warning: Cannot create relative symlink paths (different drives?). Using absolute paths.{NC}")
-            core_rel_path = core_rule_src.resolve()
-            maint_rel_path = maint_rule_src.resolve()
+        # Detect if running on Windows or in WSL
+        is_windows = platform.system() == "Windows"
+        is_wsl = "microsoft" in platform.uname().release.lower()
+        print(f"Environment detection: {'Windows' if is_windows else 'WSL' if is_wsl else 'Linux/Unix'}")
 
-        # Unlink if it exists and is not the correct link target
-        if core_rule_link.is_symlink():
-            if core_rule_link.readlink() != Path(core_rel_path):
-                core_rule_link.unlink()
-        elif core_rule_link.exists():  # It exists but isn't a symlink
-            core_rule_link.unlink()
-
-        if not core_rule_link.exists():
-            core_rule_link.symlink_to(core_rel_path)
-            print(f"Linking core rule: {CYAN}{core_rule_link.name}{NC} -> {CYAN}{core_rel_path}{NC}")
+        # Create links or copies based on environment
+        if is_windows or is_wsl:
+            # On Windows or WSL, try to create Windows hard links using PowerShell
+            try:
+                # Convert paths to Windows format if in WSL
+                if is_wsl:
+                    win_core_src = subprocess.check_output(["wslpath", "-w", str(core_rule_src)]).decode().strip()
+                    win_core_dest = subprocess.check_output(["wslpath", "-w", str(core_rule_link)]).decode().strip()
+                    win_maint_src = subprocess.check_output(["wslpath", "-w", str(maint_rule_src)]).decode().strip()
+                    win_maint_dest = subprocess.check_output(["wslpath", "-w", str(maint_rule_link)]).decode().strip()
+                else:
+                    # On native Windows, use the paths directly
+                    win_core_src = str(core_rule_src)
+                    win_core_dest = str(core_rule_link)
+                    win_maint_src = str(maint_rule_src)
+                    win_maint_dest = str(maint_rule_link)
+                
+                # Remove existing files/links if they exist
+                if core_rule_link.exists():
+                    core_rule_link.unlink()
+                    print(f"Removed existing core rule file/link: {CYAN}{core_rule_link}{NC}")
+                
+                if maint_rule_link.exists():
+                    maint_rule_link.unlink()
+                    print(f"Removed existing maintenance rule file/link: {CYAN}{maint_rule_link}{NC}")
+                
+                print(f"Creating Windows hard link for core rule...")
+                core_success = create_windows_hardlink(win_core_src, win_core_dest)
+                
+                print(f"Creating Windows hard link for maintenance rule...")
+                maint_success = create_windows_hardlink(win_maint_src, win_maint_dest)
+                
+                if core_success and maint_success:
+                    print(f"{GREEN}Created Windows hard links for rule files{NC}")
+                else:
+                    raise Exception("Failed to create one or more Windows hard links")
+                    
+            except Exception as e:
+                print(f"{YELLOW}Windows hard linking failed: {e}. Falling back to file copying...{NC}")
+                shutil.copy2(core_rule_src, core_rule_link)
+                shutil.copy2(maint_rule_src, maint_rule_link)
+                print(f"{GREEN}Copied rule files instead of linking{NC}")
         else:
-            print(f"Core rule link already exists: {CYAN}{core_rule_link.name}{NC}")
+            # On non-Windows systems, try to use regular symlinks
+            try:
+                # Create/Update symlinks using relative paths for better portability
+                try:
+                    core_rel_path = os.path.relpath(core_rule_src.resolve(), start=cursor_rules_dir.resolve())
+                    maint_rel_path = os.path.relpath(maint_rule_src.resolve(), start=cursor_rules_dir.resolve())
+                except ValueError:
+                    # Handle case where paths are on different drives (Windows) - fall back to absolute
+                    print(f"{YELLOW}Warning: Cannot create relative symlink paths (different drives?). Using absolute paths.{NC}")
+                    core_rel_path = core_rule_src.resolve()
+                    maint_rel_path = maint_rule_src.resolve()
 
-        if maint_rule_link.is_symlink():
-            if maint_rule_link.readlink() != Path(maint_rel_path):
-                maint_rule_link.unlink()
-        elif maint_rule_link.exists():
-            maint_rule_link.unlink()
+                # Unlink if it exists and is not the correct link target
+                if core_rule_link.is_symlink():
+                    if core_rule_link.readlink() != Path(core_rel_path):
+                        core_rule_link.unlink()
+                elif core_rule_link.exists():  # It exists but isn't a symlink
+                    core_rule_link.unlink()
 
-        if not maint_rule_link.exists():
-            maint_rule_link.symlink_to(maint_rel_path)
-            print(f"Linking maintenance rule: {CYAN}{maint_rule_link.name}{NC} -> {CYAN}{maint_rel_path}{NC}")
-        else:
-            print(f"Maintenance rule link already exists: {CYAN}{maint_rule_link.name}{NC}")
+                if not core_rule_link.exists():
+                    core_rule_link.symlink_to(core_rel_path)
+                    print(f"Linking core rule: {CYAN}{core_rule_link.name}{NC} -> {CYAN}{core_rel_path}{NC}")
+                else:
+                    print(f"Core rule link already exists: {CYAN}{core_rule_link.name}{NC}")
+
+                if maint_rule_link.is_symlink():
+                    if maint_rule_link.readlink() != Path(maint_rel_path):
+                        maint_rule_link.unlink()
+                elif maint_rule_link.exists():
+                    maint_rule_link.unlink()
+
+                if not maint_rule_link.exists():
+                    maint_rule_link.symlink_to(maint_rel_path)
+                    print(f"Linking maintenance rule: {CYAN}{maint_rule_link.name}{NC} -> {CYAN}{maint_rel_path}{NC}")
+                else:
+                    print(f"Maintenance rule link already exists: {CYAN}{maint_rule_link.name}{NC}")
+            except Exception as e:
+                print(f"{YELLOW}Warning: Symlink creation failed ({e}). Falling back to file copying.{NC}")
+                shutil.copy2(core_rule_src, core_rule_link)
+                shutil.copy2(maint_rule_src, maint_rule_link)
+                print(f"{GREEN}Copied rule files instead of linking{NC}")
 
         # Generate schema file from template
         if target_schema_file.exists():
